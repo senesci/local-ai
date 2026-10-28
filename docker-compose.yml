@@ -1,0 +1,44 @@
+services:
+  ollama:
+    image: ollama/ollama:rocm
+    container_name: ollama
+    restart: unless-stopped
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    environment:
+      # RX 7600 is gfx1102 (not officially supported by ROCm); present it as gfx1100
+      - HSA_OVERRIDE_GFX_VERSION=11.0.0
+      # Bind API on all interfaces
+      - OLLAMA_HOST=0.0.0.0:11434
+      # Context and KV cache settings sized for 8 GB VRAM with qwen3.5:9b Q4_K_M
+      - OLLAMA_CONTEXT_LENGTH=32768
+      - OLLAMA_FLASH_ATTENTION=1
+      - OLLAMA_KV_CACHE_TYPE=q8_0
+      # Keep model loaded; one request at a time (parallel requests multiply KV cache)
+      - OLLAMA_KEEP_ALIVE=24h
+      - OLLAMA_NUM_PARALLEL=1
+    ports:
+      - "0.0.0.0:11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # One-shot: pulls the model once the server is healthy, then exits
+  ollama-pull:
+    image: ollama/ollama:rocm
+    container_name: ollama-pull
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=ollama:11434
+    entrypoint: ["ollama", "pull", "qwen3.5:9b"]
+    restart: "no"
+
+volumes:
+  ollama:
