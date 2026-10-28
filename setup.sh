@@ -6,24 +6,32 @@
 #   2. Daily automatic apt upgrades via cron
 #   3. Daily automatic container updates (compose pull + up) via cron
 #   4. UFW: default deny incoming + outgoing; allow SSH and the Ollama API in,
-#      and the minimum egress needed for apt, Docker pulls, DNS and NTP
-#   5. Deploy docker-compose.yml to $INSTALL_DIR and start it
+#      and the minimum host egress needed for apt, Docker pulls, DNS and NTP.
+#      Containers are blocked from initiating any connection outside their
+#      Docker networks (DOCKER-USER chain); replies to inbound API requests
+#      still work.
+#   5. Deploy docker-compose.yml to $INSTALL_DIR, start it, and pull the model
+#      through a temporary egress window (local-ai-pull-model)
 #
 # Usage:  sudo ./setup.sh
 # Options (environment variables):
 #   SSH_PORT=22              SSH port to allow inbound
 #   OLLAMA_PORT=11434        Ollama API port to allow inbound
 #   ALLOW_FROM=any           Source allowed to reach SSH/Ollama (e.g. 10.90.1.0/24)
+#   CONTAINER_EGRESS_ALLOW=  Space-separated CIDRs containers MAY reach (default: none)
+#   MODEL=qwen3.5:9b         Model pulled during setup
 #   INSTALL_DIR=/opt/local-ai
 #   APT_CRON="17 4 * * *"    Schedule for apt upgrades
 #   DOCKER_CRON="47 4 * * *" Schedule for container updates
-#   SKIP_COMPOSE_UP=0        Set to 1 to skip starting the stack
+#   SKIP_COMPOSE_UP=0        Set to 1 to skip starting the stack and pulling the model
 
 set -euo pipefail
 
 SSH_PORT="${SSH_PORT:-22}"
 OLLAMA_PORT="${OLLAMA_PORT:-11434}"
 ALLOW_FROM="${ALLOW_FROM:-any}"
+CONTAINER_EGRESS_ALLOW="${CONTAINER_EGRESS_ALLOW:-}"
+MODEL="${MODEL:-qwen3.5:9b}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/local-ai}"
 APT_CRON="${APT_CRON:-17 4 * * *}"
 DOCKER_CRON="${DOCKER_CRON:-47 4 * * *}"
@@ -173,40 +181,118 @@ else
   ufw allow in from "$ALLOW_FROM" to any port "$OLLAMA_PORT" proto tcp comment 'Ollama API'
 fi
 
-# Outbound: minimum required for apt, Docker Hub / registry pulls, Ollama model pulls, DNS, NTP, DHCP.
+# Host outbound: minimum required for apt, Docker image pulls (done by dockerd
+# on the host), DNS, NTP, DHCP. Containers do not use these rules.
 ufw allow out 53 comment 'DNS'
 ufw allow out 80/tcp comment 'HTTP (apt)'
-ufw allow out 443/tcp comment 'HTTPS (apt, docker, ollama)'
+ufw allow out 443/tcp comment 'HTTPS (apt, docker image pulls)'
 ufw allow out 123/udp comment 'NTP'
 ufw allow out 67/udp comment 'DHCP'
 
-# Docker-published ports bypass UFW's INPUT rules. Enforce ALLOW_FROM for the
-# Ollama port in the DOCKER-USER chain so the restriction actually applies.
-AFTER_RULES=/etc/ufw/after.rules
-sed -i '/^# BEGIN local-ai DOCKER-USER$/,/^# END local-ai DOCKER-USER$/d' "$AFTER_RULES"
-if [[ "$ALLOW_FROM" != "any" ]]; then
-  cat >> "$AFTER_RULES" <<EOF
-# BEGIN local-ai DOCKER-USER
-*filter
-:DOCKER-USER - [0:0]
--A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
--A DOCKER-USER -p tcp -m conntrack --ctorigdstport $OLLAMA_PORT --ctdir ORIGINAL -s $ALLOW_FROM -j RETURN
--A DOCKER-USER -p tcp -m conntrack --ctorigdstport $OLLAMA_PORT --ctdir ORIGINAL -j DROP
--A DOCKER-USER -j RETURN
-COMMIT
-# END local-ai DOCKER-USER
-EOF
-fi
+# Container traffic is routed (FORWARD), and Docker's own rules accept it before
+# UFW's routed policy is consulted. Docker evaluates the DOCKER-USER chain first,
+# so all container policy goes there:
+#   - replies to inbound connections (API responses) pass
+#   - Ollama port restricted to ALLOW_FROM (published ports bypass UFW INPUT)
+#   - container <-> container traffic on Docker bridges passes
+#   - any NEW connection from a container to anything else is dropped
+#     (except CONTAINER_EGRESS_ALLOW destinations)
+build_docker_user_block() {
+  local family="$1" cidr
+  echo "# BEGIN local-ai DOCKER-USER"
+  echo "*filter"
+  echo ":DOCKER-USER - [0:0]"
+  echo "-A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN"
+  if [[ "$ALLOW_FROM" != "any" ]]; then
+    if [[ ( "$family" == 6 && "$ALLOW_FROM" == *:* ) || ( "$family" == 4 && "$ALLOW_FROM" != *:* ) ]]; then
+      echo "-A DOCKER-USER -p tcp -m conntrack --ctorigdstport $OLLAMA_PORT --ctdir ORIGINAL -s $ALLOW_FROM -j RETURN"
+    fi
+    echo "-A DOCKER-USER -p tcp -m conntrack --ctorigdstport $OLLAMA_PORT --ctdir ORIGINAL -j DROP"
+  fi
+  echo "-A DOCKER-USER -i docker0 -o docker0 -j RETURN"
+  echo "-A DOCKER-USER -i br-+ -o br-+ -j RETURN"
+  for cidr in $CONTAINER_EGRESS_ALLOW; do
+    if [[ ( "$family" == 6 && "$cidr" == *:* ) || ( "$family" == 4 && "$cidr" != *:* ) ]]; then
+      echo "-A DOCKER-USER -i docker0 -d $cidr -j RETURN"
+      echo "-A DOCKER-USER -i br-+ -d $cidr -j RETURN"
+    fi
+  done
+  echo "-A DOCKER-USER -i docker0 -m limit --limit 3/min -j LOG --log-prefix \"[DOCKER-EGRESS-DROP] \""
+  echo "-A DOCKER-USER -i br-+ -m limit --limit 3/min -j LOG --log-prefix \"[DOCKER-EGRESS-DROP] \""
+  echo "-A DOCKER-USER -i docker0 -j DROP"
+  echo "-A DOCKER-USER -i br-+ -j DROP"
+  echo "-A DOCKER-USER -j RETURN"
+  echo "COMMIT"
+  echo "# END local-ai DOCKER-USER"
+}
+
+for f in 4 6; do
+  rules=/etc/ufw/after.rules
+  [[ $f == 6 ]] && rules=/etc/ufw/after6.rules
+  [[ -f "$rules" ]] || continue
+  sed -i '/^# BEGIN local-ai DOCKER-USER$/,/^# END local-ai DOCKER-USER$/d' "$rules"
+  build_docker_user_block "$f" >> "$rules"
+done
 
 ufw --force enable
 systemctl enable ufw >/dev/null
-# Docker re-creates its own chains; restart so they sit correctly after UFW's.
+# Docker re-creates its own chains and keeps DOCKER-USER contents.
 systemctl restart docker
+
+# --- Model pull helper (temporary egress window) -----------------------------
+# The Ollama server container downloads models itself, which the egress block
+# prevents. This helper opens HTTPS + DNS for the ollama container only, for
+# the duration of one pull, then removes the rules.
+cat > /usr/local/sbin/local-ai-pull-model <<'EOF'
+#!/usr/bin/env bash
+# Usage: sudo local-ai-pull-model [model]   (default: qwen3.5:9b)
+set -euo pipefail
+MODEL="${1:-qwen3.5:9b}"
+[[ $EUID -eq 0 ]] || { echo "Run as root." >&2; exit 1; }
+
+IP4="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' ollama | awk '{print $1}')"
+[[ -n "$IP4" ]] || { echo "ollama container not running." >&2; exit 1; }
+
+RULES=(
+  "-s $IP4 -p tcp --dport 443 -j RETURN"
+  "-s $IP4 -p udp --dport 53 -j RETURN"
+  "-s $IP4 -p tcp --dport 53 -j RETURN"
+)
+cleanup() {
+  for r in "${RULES[@]}"; do
+    # shellcheck disable=SC2086
+    iptables -D DOCKER-USER $r 2>/dev/null || true
+  done
+  echo "Egress window closed."
+}
+trap cleanup EXIT INT TERM
+
+for r in "${RULES[@]}"; do
+  # shellcheck disable=SC2086
+  iptables -I DOCKER-USER 1 $r
+done
+echo "Egress window open for ollama ($IP4). Pulling $MODEL..."
+docker exec ollama ollama pull "$MODEL"
+EOF
+chmod 0755 /usr/local/sbin/local-ai-pull-model
 
 # --- 5. Start the stack ------------------------------------------------------
 if [[ "$SKIP_COMPOSE_UP" != "1" ]]; then
   log "Starting Ollama stack"
-  (cd "$INSTALL_DIR" && docker compose up -d)
+  (cd "$INSTALL_DIR" && docker compose up -d --remove-orphans)
+
+  log "Waiting for ollama to become healthy"
+  for _ in $(seq 1 60); do
+    [[ "$(docker inspect -f '{{.State.Health.Status}}' ollama 2>/dev/null)" == "healthy" ]] && break
+    sleep 2
+  done
+
+  if [[ "$(docker inspect -f '{{.State.Health.Status}}' ollama 2>/dev/null)" == "healthy" ]]; then
+    log "Pulling $MODEL through temporary egress window"
+    /usr/local/sbin/local-ai-pull-model "$MODEL" || warn "Model pull failed. Retry: sudo local-ai-pull-model $MODEL"
+  else
+    warn "ollama not healthy. Check: docker logs ollama"
+  fi
 fi
 
 log "Done."
@@ -215,4 +301,6 @@ echo
 echo "Stack dir:          $INSTALL_DIR"
 echo "apt updates:        $APT_CRON  -> /var/log/apt-auto-update.log"
 echo "container updates:  $DOCKER_CRON  -> /var/log/docker-auto-update.log"
-[[ -e /dev/kfd ]] || echo "WARNING: /dev/kfd missing. Reboot, then: cd $INSTALL_DIR && docker compose up -d"
+echo "container egress:   blocked (allowed: ${CONTAINER_EGRESS_ALLOW:-none})"
+echo "pull/update model:  sudo local-ai-pull-model <model>"
+[[ -e /dev/kfd ]] || echo "WARNING: /dev/kfd missing. Reboot, then: cd $INSTALL_DIR && docker compose up -d && sudo local-ai-pull-model"

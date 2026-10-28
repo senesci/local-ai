@@ -28,17 +28,8 @@ services:
       timeout: 5s
       retries: 10
 
-  # One-shot: pulls the model once the server is healthy, then exits
-  ollama-pull:
-    image: ollama/ollama:rocm
-    container_name: ollama-pull
-    depends_on:
-      ollama:
-        condition: service_healthy
-    environment:
-      - OLLAMA_HOST=ollama:11434
-    entrypoint: ["ollama", "pull", "qwen3.5:9b"]
-    restart: "no"
+# Models are pulled with `sudo local-ai-pull-model <model>` (installed by setup.sh),
+# which opens a temporary egress window: containers have no internet access otherwise.
 
 volumes:
   ollama:
